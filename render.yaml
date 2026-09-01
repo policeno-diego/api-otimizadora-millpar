@@ -24,3 +24,7 @@ services:
         sync: false
       - key: AUTH_TOKEN_TTL_HOURS
         value: "12"
+      - key: AUTH_USER_DB_PATH
+        value: auth/usuarios_app
+      - key: AUTH_USER_DB_SECRET
+        generateValue: true

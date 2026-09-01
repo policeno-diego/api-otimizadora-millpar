@@ -15,9 +15,10 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request as FastApiReq
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+from cryptography.fernet import Fernet, InvalidToken
 
 
-APP_VERSION = "render-free-auth-0.4"
+APP_VERSION = "render-free-auth-db-0.5"
 FIREBASE_BASE_URL = os.getenv(
     "FIREBASE_BASE_URL",
     "https://base-otimizadora-default-rtdb.firebaseio.com",
@@ -27,6 +28,8 @@ API_TOKEN = os.getenv("API_TOKEN", "").strip()
 AUTH_TOKEN_SECRET = os.getenv("AUTH_TOKEN_SECRET", API_TOKEN).strip()
 AUTH_USERS_JSON = os.getenv("AUTH_USERS_JSON", "").strip()
 AUTH_TOKEN_TTL_HOURS = int(os.getenv("AUTH_TOKEN_TTL_HOURS", "12"))
+AUTH_USER_DB_PATH = os.getenv("AUTH_USER_DB_PATH", "auth/usuarios_app").strip("/")
+AUTH_USER_DB_SECRET = os.getenv("AUTH_USER_DB_SECRET", AUTH_TOKEN_SECRET).strip()
 ALLOW_PUBLIC_READ = os.getenv("ALLOW_PUBLIC_READ", "true").strip().lower() in {
     "1",
     "true",
@@ -47,12 +50,13 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["*"],
 )
 
 _cache: dict[str, Any] = {"ts": 0.0, "snapshot": None}
 _dados_cache: dict[str, Any] = {"ts": 0.0, "chave": "", "registros": [], "s4s": []}
+_login_attempts: dict[str, list[float]] = {}
 
 CLASSES_UTEIS = {"CLEAR", "PRIMED", "MULTIBLOCK", "ESMOADO", "SOLIDO", "TREAD", "POLEGADA"}
 CLASSES_WASTE = {"WASTE", "LONG WASTE", "BLADE WASTE", "NO PAINEL", "RERIP WASTE", "FULL WASTE BOARD", "NO BAGS"}
@@ -81,6 +85,37 @@ class LoginPayload(BaseModel):
     senha: str
 
 
+class NovoUsuarioPayload(BaseModel):
+    usuario: str
+    senha: str
+    nome: str | None = None
+    role: str = "viewer"
+    ativo: bool = True
+    trocar_senha: bool = False
+
+
+class SolicitarAcessoPayload(BaseModel):
+    usuario: str
+    senha: str
+    nome: str | None = None
+
+
+class AlterarSenhaPayload(BaseModel):
+    senha_atual: str
+    nova_senha: str
+
+
+class ResetarSenhaPayload(BaseModel):
+    nova_senha: str
+
+
+class AtualizarUsuarioPayload(BaseModel):
+    nome: str | None = None
+    role: str | None = None
+    ativo: bool | None = None
+    trocar_senha: bool | None = None
+
+
 def _json_b64(payload: dict[str, Any]) -> str:
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
@@ -92,14 +127,18 @@ def _b64_decode_json(valor: str) -> dict[str, Any]:
     return json.loads(raw.decode("utf-8"))
 
 
-def _auth_users() -> dict[str, Any]:
+def _auth_users_env() -> tuple[dict[str, Any], bool]:
     if not AUTH_USERS_JSON:
-        return {}
+        return {}, True
     try:
         users = json.loads(AUTH_USERS_JSON)
     except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="AUTH_USERS_JSON invalido no Render")
-    return users if isinstance(users, dict) else {}
+        return {}, False
+    return users if isinstance(users, dict) else {}, isinstance(users, dict)
+
+
+def _normalizar_usuario(usuario: str) -> str:
+    return " ".join(str(usuario or "").strip().lower().split())
 
 
 def _verify_password(senha: str, senha_hash: str) -> bool:
@@ -120,6 +159,133 @@ def _hash_password(senha: str, iteracoes: int = 210_000) -> str:
     salt = secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac("sha256", senha.encode("utf-8"), salt, iteracoes)
     return f"pbkdf2_sha256${iteracoes}${salt.hex()}${digest.hex()}"
+
+
+def _validar_senha_forte(senha: str) -> None:
+    if len(senha or "") < 8:
+        raise HTTPException(status_code=400, detail="A senha deve ter pelo menos 8 caracteres")
+
+
+def _validar_role(role: str) -> str:
+    role_norm = str(role or "viewer").strip().lower()
+    if role_norm not in {"viewer", "admin"}:
+        raise HTTPException(status_code=400, detail="Perfil invalido. Use viewer ou admin")
+    return role_norm
+
+
+def _firebase_url(path: str) -> str:
+    safe_path = "/".join(quote(p, safe="") for p in path.strip("/").split("/") if p)
+    return f"{FIREBASE_BASE_URL}/{safe_path}.json"
+
+
+def _firebase_request(method: str, path: str, body: Any | None = None) -> Any:
+    data = None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = Request(_firebase_url(path), data=data, headers=headers, method=method)
+    context = None if FIREBASE_VERIFY_SSL else ssl._create_unverified_context()
+    with urlopen(req, timeout=20, context=context) as resp:
+        raw = resp.read().decode("utf-8")
+    if not raw or raw == "null":
+        return None
+    return json.loads(raw)
+
+
+def _firebase_set(path: str, body: Any) -> Any:
+    return _firebase_request("PUT", path, body)
+
+
+def _user_db_secret() -> str:
+    secret = AUTH_USER_DB_SECRET or AUTH_TOKEN_SECRET or API_TOKEN
+    if not secret:
+        raise HTTPException(status_code=500, detail="AUTH_USER_DB_SECRET nao configurado")
+    return secret
+
+
+def _fernet() -> Fernet:
+    key = base64.urlsafe_b64encode(hashlib.sha256(_user_db_secret().encode("utf-8")).digest())
+    return Fernet(key)
+
+
+def _auth_users_db_read() -> dict[str, Any]:
+    db = _firebase_get(AUTH_USER_DB_PATH) or {}
+    if not isinstance(db, dict) or not db.get("ciphertext"):
+        return {}
+    try:
+        raw = _fernet().decrypt(str(db["ciphertext"]).encode("utf-8"), ttl=None)
+        users = json.loads(raw.decode("utf-8"))
+    except (InvalidToken, json.JSONDecodeError, ValueError, TypeError):
+        raise HTTPException(status_code=500, detail="Banco de usuarios invalido ou segredo incorreto")
+    return users if isinstance(users, dict) else {}
+
+
+def _auth_users_db_write(users: dict[str, Any]) -> None:
+    raw = json.dumps(users, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    token = _fernet().encrypt(raw).decode("utf-8")
+    _firebase_set(
+        AUTH_USER_DB_PATH,
+        {
+            "version": 1,
+            "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "ciphertext": token,
+        },
+    )
+
+
+def _auth_users() -> dict[str, Any]:
+    env_users, _ = _auth_users_env()
+    users: dict[str, Any] = {}
+    for usuario, info in env_users.items():
+        usuario_norm = _normalizar_usuario(usuario)
+        if isinstance(info, dict):
+            item = dict(info)
+        else:
+            item = {"senha_hash": str(info)}
+        item.setdefault("nome", usuario_norm)
+        item.setdefault("role", "viewer")
+        item.setdefault("ativo", True)
+        item.setdefault("origem", "env")
+        users[usuario_norm] = item
+    users.update(_auth_users_db_read())
+    return users
+
+
+def _public_user(usuario: str, info: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "usuario": usuario,
+        "nome": info.get("nome") or usuario,
+        "role": info.get("role") or "viewer",
+        "ativo": bool(info.get("ativo", True)),
+        "trocar_senha": bool(info.get("trocar_senha", False)),
+        "pendente": bool(info.get("pendente", False)),
+        "origem": info.get("origem") or "db",
+        "criado_em": info.get("criado_em"),
+        "atualizado_em": info.get("atualizado_em"),
+        "ultimo_login": info.get("ultimo_login"),
+    }
+
+
+def _registrar_falha_login(usuario: str) -> None:
+    agora = time.time()
+    janela = agora - 15 * 60
+    tentativas = [t for t in _login_attempts.get(usuario, []) if t >= janela]
+    tentativas.append(agora)
+    _login_attempts[usuario] = tentativas
+
+
+def _checar_limite_login(usuario: str) -> None:
+    agora = time.time()
+    janela = agora - 15 * 60
+    tentativas = [t for t in _login_attempts.get(usuario, []) if t >= janela]
+    _login_attempts[usuario] = tentativas
+    if len(tentativas) >= 8:
+        raise HTTPException(status_code=429, detail="Muitas tentativas. Aguarde alguns minutos")
+
+
+def _limpar_falhas_login(usuario: str) -> None:
+    _login_attempts.pop(usuario, None)
 
 
 def _assinar_token(usuario: str, nome: str, role: str = "viewer") -> str:
@@ -157,6 +323,28 @@ def _validar_token_sessao(token: str) -> dict[str, Any] | None:
     return payload
 
 
+def _require_auth(x_api_token: str | None, authorization: str | None, x_auth_token: str | None = None) -> dict[str, Any]:
+    if ALLOW_PUBLIC_READ:
+        return {"sub": "public", "nome": "public", "role": "viewer"}
+
+    bearer = _extrair_bearer(authorization, x_auth_token)
+    if API_TOKEN and (x_api_token == API_TOKEN or bearer == API_TOKEN):
+        return {"sub": "api_token", "nome": "API Token", "role": "admin"}
+
+    payload = _validar_token_sessao(bearer)
+    if payload:
+        return payload
+
+    raise HTTPException(status_code=401, detail="Token invalido ou ausente")
+
+
+def _require_admin(x_api_token: str | None, authorization: str | None, x_auth_token: str | None = None) -> dict[str, Any]:
+    payload = _require_auth(x_api_token, authorization, x_auth_token)
+    if payload.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Acesso restrito ao administrador")
+    return payload
+
+
 def _extrair_bearer(authorization: str | None, x_auth_token: str | None = None) -> str:
     if authorization and authorization.lower().startswith("bearer "):
         return authorization[7:].strip()
@@ -164,30 +352,11 @@ def _extrair_bearer(authorization: str | None, x_auth_token: str | None = None) 
 
 
 def _check_token(x_api_token: str | None, authorization: str | None, x_auth_token: str | None = None) -> None:
-    if ALLOW_PUBLIC_READ:
-        return
-
-    bearer = _extrair_bearer(authorization, x_auth_token)
-
-    if API_TOKEN and (x_api_token == API_TOKEN or bearer == API_TOKEN):
-        return
-
-    if _validar_token_sessao(bearer):
-        return
-
-    raise HTTPException(status_code=401, detail="Token invalido ou ausente")
+    _require_auth(x_api_token, authorization, x_auth_token)
 
 
 def _firebase_get(path: str) -> Any:
-    safe_path = "/".join(quote(p, safe="") for p in path.strip("/").split("/") if p)
-    url = f"{FIREBASE_BASE_URL}/{safe_path}.json"
-    req = Request(url, headers={"Accept": "application/json"})
-    context = None if FIREBASE_VERIFY_SSL else ssl._create_unverified_context()
-    with urlopen(req, timeout=20, context=context) as resp:
-        raw = resp.read().decode("utf-8")
-    if not raw or raw == "null":
-        return None
-    return json.loads(raw)
+    return _firebase_request("GET", path)
 
 
 def _datas_periodo(data_inicio: str, data_fim: str) -> list[str]:
@@ -777,26 +946,70 @@ def api_reprocessar(
 
 @app.get("/api/auth/ping")
 def api_auth_ping() -> dict[str, Any]:
-    return {"ok": True, "origem": "render", "usuarios_configurados": bool(_auth_users())}
+    _, env_valido = _auth_users_env()
+    users = _auth_users()
+    return {
+        "ok": True,
+        "origem": "render",
+        "usuarios_configurados": bool(users),
+        "auth_users_json_valido": env_valido,
+        "banco_usuarios_configurado": bool(_auth_users_db_read()),
+    }
 
 
 @app.post("/api/auth/login")
 def api_auth_login(payload: LoginPayload) -> dict[str, Any]:
+    usuario = _normalizar_usuario(payload.usuario)
+    _checar_limite_login(usuario)
     users = _auth_users()
-    usuario = payload.usuario.strip().lower()
     info = users.get(usuario) or {}
     senha_hash = info.get("senha_hash") if isinstance(info, dict) else info
     if not senha_hash or not _verify_password(payload.senha, str(senha_hash)):
+        _registrar_falha_login(usuario)
         raise HTTPException(status_code=401, detail="Usuario ou senha invalidos")
+    if isinstance(info, dict) and not bool(info.get("ativo", True)):
+        raise HTTPException(status_code=403, detail="Usuario inativo ou aguardando aprovacao")
+    _limpar_falhas_login(usuario)
     nome = str(info.get("nome") or usuario) if isinstance(info, dict) else usuario
     role = str(info.get("role") or "viewer") if isinstance(info, dict) else "viewer"
+    db_users = _auth_users_db_read()
+    if usuario in db_users:
+        db_users[usuario]["ultimo_login"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        _auth_users_db_write(db_users)
     return {
         "ok": True,
         "usuario": nome,
         "role": role,
         "token": _assinar_token(usuario, nome, role),
         "expira_em_horas": AUTH_TOKEN_TTL_HOURS,
+        "trocar_senha": bool(info.get("trocar_senha", False)) if isinstance(info, dict) else False,
     }
+
+
+@app.post("/api/auth/solicitar-acesso")
+def api_auth_solicitar_acesso(payload: SolicitarAcessoPayload) -> dict[str, Any]:
+    usuario = _normalizar_usuario(payload.usuario)
+    if not usuario:
+        raise HTTPException(status_code=400, detail="Usuario obrigatorio")
+    _validar_senha_forte(payload.senha)
+    users = _auth_users()
+    if usuario in users:
+        raise HTTPException(status_code=409, detail="Usuario ja existe")
+    db_users = _auth_users_db_read()
+    agora = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    db_users[usuario] = {
+        "nome": payload.nome or usuario,
+        "role": "viewer",
+        "senha_hash": _hash_password(payload.senha),
+        "ativo": False,
+        "pendente": True,
+        "trocar_senha": False,
+        "origem": "db",
+        "criado_em": agora,
+        "atualizado_em": agora,
+    }
+    _auth_users_db_write(db_users)
+    return {"ok": True, "status": "pendente_aprovacao"}
 
 
 @app.get("/api/auth/verificar")
@@ -816,8 +1029,128 @@ def api_auth_verificar(
     }
 
 
+@app.post("/api/auth/alterar-senha")
+def api_auth_alterar_senha(
+    payload: AlterarSenhaPayload,
+    x_auth_token: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    sessao = _require_auth(None, authorization, x_auth_token)
+    usuario = str(sessao.get("sub") or "")
+    db_users = _auth_users_db_read()
+    info = db_users.get(usuario)
+    if not isinstance(info, dict):
+        raise HTTPException(status_code=400, detail="Senha deste usuario deve ser alterada pelo administrador")
+    if not _verify_password(payload.senha_atual, str(info.get("senha_hash") or "")):
+        raise HTTPException(status_code=401, detail="Senha atual invalida")
+    _validar_senha_forte(payload.nova_senha)
+    info["senha_hash"] = _hash_password(payload.nova_senha)
+    info["trocar_senha"] = False
+    info["atualizado_em"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    db_users[usuario] = info
+    _auth_users_db_write(db_users)
+    return {"ok": True}
+
+
 @app.post("/api/auth/logout")
 def api_auth_logout() -> dict[str, Any]:
+    return {"ok": True}
+
+
+@app.get("/api/admin/usuarios")
+def api_admin_usuarios(
+    x_api_token: str | None = Header(default=None),
+    x_auth_token: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_admin(x_api_token, authorization, x_auth_token)
+    users = _auth_users()
+    return {"usuarios": [_public_user(usuario, info) for usuario, info in sorted(users.items())]}
+
+
+@app.post("/api/admin/usuarios")
+def api_admin_criar_usuario(
+    payload: NovoUsuarioPayload,
+    x_api_token: str | None = Header(default=None),
+    x_auth_token: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    admin = _require_admin(x_api_token, authorization, x_auth_token)
+    usuario = _normalizar_usuario(payload.usuario)
+    if not usuario:
+        raise HTTPException(status_code=400, detail="Usuario obrigatorio")
+    _validar_senha_forte(payload.senha)
+    role = _validar_role(payload.role)
+    if usuario in _auth_users():
+        raise HTTPException(status_code=409, detail="Usuario ja existe")
+    db_users = _auth_users_db_read()
+    agora = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    db_users[usuario] = {
+        "nome": payload.nome or usuario,
+        "role": role,
+        "senha_hash": _hash_password(payload.senha),
+        "ativo": bool(payload.ativo),
+        "pendente": False,
+        "trocar_senha": bool(payload.trocar_senha),
+        "origem": "db",
+        "criado_por": admin.get("sub"),
+        "criado_em": agora,
+        "atualizado_em": agora,
+    }
+    _auth_users_db_write(db_users)
+    return {"ok": True, "usuario": _public_user(usuario, db_users[usuario])}
+
+
+@app.patch("/api/admin/usuarios/{usuario}")
+def api_admin_atualizar_usuario(
+    usuario: str,
+    payload: AtualizarUsuarioPayload,
+    x_api_token: str | None = Header(default=None),
+    x_auth_token: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_admin(x_api_token, authorization, x_auth_token)
+    usuario_norm = _normalizar_usuario(usuario)
+    db_users = _auth_users_db_read()
+    info = db_users.get(usuario_norm)
+    if not isinstance(info, dict):
+        raise HTTPException(status_code=404, detail="Usuario nao encontrado no banco editavel")
+    if payload.nome is not None:
+        info["nome"] = payload.nome or usuario_norm
+    if payload.role is not None:
+        info["role"] = _validar_role(payload.role)
+    if payload.ativo is not None:
+        info["ativo"] = bool(payload.ativo)
+    if payload.trocar_senha is not None:
+        info["trocar_senha"] = bool(payload.trocar_senha)
+    if bool(info.get("ativo", True)):
+        info["pendente"] = False
+    info["atualizado_em"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    db_users[usuario_norm] = info
+    _auth_users_db_write(db_users)
+    return {"ok": True, "usuario": _public_user(usuario_norm, info)}
+
+
+@app.post("/api/admin/usuarios/{usuario}/resetar-senha")
+def api_admin_resetar_senha(
+    usuario: str,
+    payload: ResetarSenhaPayload,
+    x_api_token: str | None = Header(default=None),
+    x_auth_token: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_admin(x_api_token, authorization, x_auth_token)
+    usuario_norm = _normalizar_usuario(usuario)
+    db_users = _auth_users_db_read()
+    info = db_users.get(usuario_norm)
+    if not isinstance(info, dict):
+        raise HTTPException(status_code=404, detail="Usuario nao encontrado no banco editavel")
+    _validar_senha_forte(payload.nova_senha)
+    info["senha_hash"] = _hash_password(payload.nova_senha)
+    info["trocar_senha"] = True
+    info["atualizado_em"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    db_users[usuario_norm] = info
+    _auth_users_db_write(db_users)
     return {"ok": True}
 
 
