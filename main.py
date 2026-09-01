@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 
-APP_VERSION = "render-free-detalhado-0.2"
+APP_VERSION = "render-free-filtros-0.3"
 FIREBASE_BASE_URL = os.getenv(
     "FIREBASE_BASE_URL",
     "https://base-otimizadora-default-rtdb.firebaseio.com",
@@ -577,20 +577,34 @@ def api_status(
 
 @app.get("/api/filtros")
 def api_filtros(
+    data_inicio: str | None = Query(default=None),
+    data_fim: str | None = Query(default=None),
+    turno: str = Query(default=""),
+    otimizadora: str = Query(default=""),
+    bitola: str = Query(default=""),
+    produto: str = Query(default=""),
     x_api_token: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     _check_token(x_api_token, authorization)
     snap = _snapshot()
-    data_inicio, data_fim = _periodo_padrao(snap)
-    registros, _ = _carregar_dados_detalhados(data_inicio, data_fim)
+    data_inicio_calc = data_inicio or _periodo_padrao(snap)[0]
+    data_fim_calc = data_fim or _periodo_padrao(snap)[1]
+    registros, _ = _carregar_dados_detalhados(data_inicio_calc, data_fim_calc)
     if registros:
+        regs = _filtrar_registros(registros, data_inicio_calc, data_fim_calc, turno, otimizadora, bitola, produto)
         return {
-            "bitolas": sorted({str(r.get("bitola") or "") for r in registros if r.get("bitola")}),
-            "produtos": sorted({str(r.get("nome_produto") or "") for r in registros if r.get("nome_produto")}),
-            "otimizadoras": sorted({str(r.get("otimizadora") or "") for r in registros if r.get("otimizadora")}),
+            "turnos": sorted({str(r.get("turno") or "") for r in regs if r.get("turno")}),
+            "bitolas": sorted({str(r.get("bitola") or "") for r in regs if r.get("bitola")}),
+            "produtos": sorted({str(r.get("nome_produto") or "") for r in regs if r.get("nome_produto")}),
+            "otimizadoras": sorted({str(r.get("otimizadora") or "") for r in regs if r.get("otimizadora")}),
         }
-    return snap.get("filtros") or {"bitolas": [], "produtos": [], "otimizadoras": []}
+    filtros = snap.get("filtros") or {}
+    filtros.setdefault("turnos", ["A", "B", "C"])
+    filtros.setdefault("bitolas", [])
+    filtros.setdefault("produtos", [])
+    filtros.setdefault("otimizadoras", [])
+    return filtros
 
 
 @app.get("/api/parametros")
