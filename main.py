@@ -1,5 +1,9 @@
 import json
+import base64
+import hashlib
+import hmac
 import os
+import secrets
 import ssl
 import time
 from datetime import date, datetime, timedelta
@@ -10,15 +14,19 @@ from urllib.request import Request, urlopen
 from fastapi import FastAPI, Header, HTTPException, Query, Request as FastApiRequest
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 
 
-APP_VERSION = "render-free-filtros-0.3"
+APP_VERSION = "render-free-auth-0.4"
 FIREBASE_BASE_URL = os.getenv(
     "FIREBASE_BASE_URL",
     "https://base-otimizadora-default-rtdb.firebaseio.com",
 ).rstrip("/")
 SNAPSHOT_PATH = os.getenv("SNAPSHOT_PATH", "snapshot").strip("/")
 API_TOKEN = os.getenv("API_TOKEN", "").strip()
+AUTH_TOKEN_SECRET = os.getenv("AUTH_TOKEN_SECRET", API_TOKEN).strip()
+AUTH_USERS_JSON = os.getenv("AUTH_USERS_JSON", "").strip()
+AUTH_TOKEN_TTL_HOURS = int(os.getenv("AUTH_TOKEN_TTL_HOURS", "12"))
 ALLOW_PUBLIC_READ = os.getenv("ALLOW_PUBLIC_READ", "true").strip().lower() in {
     "1",
     "true",
@@ -68,16 +76,106 @@ PRODUTOS_FORA_PADRAO_COMPRIMENTO_BLOCKS = {
 }
 
 
-def _check_token(x_api_token: str | None, authorization: str | None) -> None:
-    if not API_TOKEN or ALLOW_PUBLIC_READ:
+class LoginPayload(BaseModel):
+    usuario: str
+    senha: str
+
+
+def _json_b64(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64_decode_json(valor: str) -> dict[str, Any]:
+    padding = "=" * (-len(valor) % 4)
+    raw = base64.urlsafe_b64decode((valor + padding).encode("ascii"))
+    return json.loads(raw.decode("utf-8"))
+
+
+def _auth_users() -> dict[str, Any]:
+    if not AUTH_USERS_JSON:
+        return {}
+    try:
+        users = json.loads(AUTH_USERS_JSON)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="AUTH_USERS_JSON invalido no Render")
+    return users if isinstance(users, dict) else {}
+
+
+def _verify_password(senha: str, senha_hash: str) -> bool:
+    partes = str(senha_hash or "").split("$")
+    if len(partes) != 4 or partes[0] != "pbkdf2_sha256":
+        return False
+    try:
+        iteracoes = int(partes[1])
+        salt = bytes.fromhex(partes[2])
+        esperado = bytes.fromhex(partes[3])
+    except ValueError:
+        return False
+    recebido = hashlib.pbkdf2_hmac("sha256", senha.encode("utf-8"), salt, iteracoes)
+    return hmac.compare_digest(recebido, esperado)
+
+
+def _hash_password(senha: str, iteracoes: int = 210_000) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", senha.encode("utf-8"), salt, iteracoes)
+    return f"pbkdf2_sha256${iteracoes}${salt.hex()}${digest.hex()}"
+
+
+def _assinar_token(usuario: str, nome: str, role: str = "viewer") -> str:
+    if not AUTH_TOKEN_SECRET:
+        raise HTTPException(status_code=500, detail="AUTH_TOKEN_SECRET nao configurado no Render")
+    agora = int(time.time())
+    payload = {
+        "sub": usuario,
+        "nome": nome,
+        "role": role,
+        "iat": agora,
+        "exp": agora + AUTH_TOKEN_TTL_HOURS * 3600,
+    }
+    corpo = _json_b64(payload)
+    assinatura = hmac.new(AUTH_TOKEN_SECRET.encode("utf-8"), corpo.encode("ascii"), hashlib.sha256).digest()
+    return corpo + "." + base64.urlsafe_b64encode(assinatura).decode("ascii").rstrip("=")
+
+
+def _validar_token_sessao(token: str) -> dict[str, Any] | None:
+    if not token or not AUTH_TOKEN_SECRET or "." not in token:
+        return None
+    corpo, assinatura_recebida = token.rsplit(".", 1)
+    assinatura = hmac.new(AUTH_TOKEN_SECRET.encode("utf-8"), corpo.encode("ascii"), hashlib.sha256).digest()
+    assinatura_ok = base64.urlsafe_b64encode(assinatura).decode("ascii").rstrip("=")
+    if not hmac.compare_digest(assinatura_recebida, assinatura_ok):
+        return None
+    try:
+        payload = _b64_decode_json(corpo)
+    except Exception:
+        return None
+    if int(payload.get("exp") or 0) < int(time.time()):
+        return None
+    if str(payload.get("sub") or "") not in _auth_users():
+        return None
+    return payload
+
+
+def _extrair_bearer(authorization: str | None, x_auth_token: str | None = None) -> str:
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return x_auth_token or ""
+
+
+def _check_token(x_api_token: str | None, authorization: str | None, x_auth_token: str | None = None) -> None:
+    if ALLOW_PUBLIC_READ:
         return
 
-    bearer = ""
-    if authorization and authorization.lower().startswith("bearer "):
-        bearer = authorization[7:].strip()
+    bearer = _extrair_bearer(authorization, x_auth_token)
 
-    if x_api_token != API_TOKEN and bearer != API_TOKEN:
-        raise HTTPException(status_code=401, detail="Token invalido ou ausente")
+    if API_TOKEN and (x_api_token == API_TOKEN or bearer == API_TOKEN):
+        return
+
+    if _validar_token_sessao(bearer):
+        return
+
+    raise HTTPException(status_code=401, detail="Token invalido ou ausente")
 
 
 def _firebase_get(path: str) -> Any:
@@ -679,7 +777,48 @@ def api_reprocessar(
 
 @app.get("/api/auth/ping")
 def api_auth_ping() -> dict[str, Any]:
-    return {"ok": True, "origem": "render"}
+    return {"ok": True, "origem": "render", "usuarios_configurados": bool(_auth_users())}
+
+
+@app.post("/api/auth/login")
+def api_auth_login(payload: LoginPayload) -> dict[str, Any]:
+    users = _auth_users()
+    usuario = payload.usuario.strip().lower()
+    info = users.get(usuario) or {}
+    senha_hash = info.get("senha_hash") if isinstance(info, dict) else info
+    if not senha_hash or not _verify_password(payload.senha, str(senha_hash)):
+        raise HTTPException(status_code=401, detail="Usuario ou senha invalidos")
+    nome = str(info.get("nome") or usuario) if isinstance(info, dict) else usuario
+    role = str(info.get("role") or "viewer") if isinstance(info, dict) else "viewer"
+    return {
+        "ok": True,
+        "usuario": nome,
+        "role": role,
+        "token": _assinar_token(usuario, nome, role),
+        "expira_em_horas": AUTH_TOKEN_TTL_HOURS,
+    }
+
+
+@app.get("/api/auth/verificar")
+def api_auth_verificar(
+    x_auth_token: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    bearer = _extrair_bearer(authorization, x_auth_token)
+    payload = _validar_token_sessao(bearer)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Sessao invalida ou expirada")
+    return {
+        "ok": True,
+        "usuario": payload.get("nome") or payload.get("sub"),
+        "role": payload.get("role") or "viewer",
+        "exp": payload.get("exp"),
+    }
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout() -> dict[str, Any]:
+    return {"ok": True}
 
 
 @app.get("/debug/snapshot-path")
@@ -691,6 +830,7 @@ def debug_snapshot_path(request: FastApiRequest) -> dict[str, Any]:
         "cache_seconds": CACHE_SECONDS,
         "token_configurado": token_configurado,
         "allow_public_read": ALLOW_PUBLIC_READ,
+        "auth_users_configurados": bool(_auth_users()),
         "firebase_verify_ssl": FIREBASE_VERIFY_SSL,
         "url_teste_dados": str(request.url_for("api_dados"))
         + "?"
