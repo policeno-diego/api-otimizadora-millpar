@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from cryptography.fernet import Fernet, InvalidToken
 
 
-APP_VERSION = "render-free-auth-db-0.5"
+APP_VERSION = "render-free-auth-db-0.6"
 FIREBASE_BASE_URL = os.getenv(
     "FIREBASE_BASE_URL",
     "https://base-otimizadora-default-rtdb.firebaseio.com",
@@ -50,7 +50,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -392,7 +392,20 @@ def _carregar_dados_detalhados(data_inicio: str, data_fim: str) -> tuple[list[di
     for dia in _datas_periodo(data_inicio, data_fim):
         dados_dia = _firebase_get(f"dados_detalhados/{dia}") or {}
         if isinstance(dados_dia, dict):
+            compacto = dados_dia.get("registros_compactos") or {}
             registros_diretos = dados_dia.get("registros") or []
+            if isinstance(compacto, dict) and compacto.get("versao") == 2:
+                colunas = compacto.get("colunas") or []
+                dicionarios = compacto.get("dicionarios") or {}
+                for linha in compacto.get("linhas") or []:
+                    registro = {"data": dia}
+                    for idx, coluna in enumerate(colunas):
+                        valor = linha[idx] if idx < len(linha) else None
+                        if coluna in dicionarios and isinstance(valor, int):
+                            tabela = dicionarios.get(coluna) or []
+                            valor = tabela[valor] if 0 <= valor < len(tabela) else ""
+                        registro[coluna] = valor
+                    registros_diretos.append(registro)
             if registros_diretos:
                 registros.extend(registros_diretos)
             else:
@@ -1150,6 +1163,27 @@ def api_admin_resetar_senha(
     info["trocar_senha"] = True
     info["atualizado_em"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     db_users[usuario_norm] = info
+    _auth_users_db_write(db_users)
+    return {"ok": True}
+
+
+@app.delete("/api/admin/usuarios/{usuario}")
+def api_admin_excluir_usuario(
+    usuario: str,
+    x_api_token: str | None = Header(default=None),
+    x_auth_token: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    admin = _require_admin(x_api_token, authorization, x_auth_token)
+    usuario_norm = _normalizar_usuario(usuario)
+    if not usuario_norm:
+        raise HTTPException(status_code=400, detail="Usuario obrigatorio")
+    if usuario_norm == admin.get("sub"):
+        raise HTTPException(status_code=400, detail="O administrador logado nao pode excluir a propria conta")
+    db_users = _auth_users_db_read()
+    if usuario_norm not in db_users:
+        raise HTTPException(status_code=404, detail="Usuario nao encontrado no banco editavel")
+    del db_users[usuario_norm]
     _auth_users_db_write(db_users)
     return {"ok": True}
 
