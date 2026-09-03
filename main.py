@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from cryptography.fernet import Fernet, InvalidToken
 
 
-APP_VERSION = "render-free-auth-db-0.6"
+APP_VERSION = "render-free-auth-db-0.7-historico-v2"
 FIREBASE_BASE_URL = os.getenv(
     "FIREBASE_BASE_URL",
     "https://base-otimizadora-default-rtdb.firebaseio.com",
