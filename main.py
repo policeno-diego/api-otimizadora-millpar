@@ -569,12 +569,19 @@ def _calcular_metricas_cloud(registros: list[dict[str, Any]], s4s: list[dict[str
     mask_util = [c in CLASSES_UTEIS for c in classes]
     mask_waste = [c in CLASSES_WASTE for c in classes]
     mask_no = [c in CLASSES_NO for c in classes]
+    mask_no_painel = [c == "NO PAINEL" for c in classes]
     vol_util = sum(v for v, ok in zip(vols, mask_util) if ok)
     vol_waste = sum(v for v, ok in zip(vols, mask_waste) if ok)
     vol_no = sum(v for v, ok in zip(vols, mask_no) if ok)
+    vol_no_painel = sum(v for v, ok in zip(vols, mask_no_painel) if ok)
+    vol_no_total = vol_no
+    vol_no = vol_no_painel
     pec_total = sum(pecs)
     pec_util = sum(p for p, ok in zip(pecs, mask_util) if ok)
     pec_no = sum(p for p, ok in zip(pecs, mask_no) if ok)
+    pec_no_painel = sum(p for p, ok in zip(pecs, mask_no_painel) if ok)
+    pec_no_total = pec_no
+    pec_no = pec_no_painel
 
     def pct(a: float, b: float) -> float:
         return round(a / b * 100, 2) if b > 0 else 0
@@ -593,7 +600,7 @@ def _calcular_metricas_cloud(registros: list[dict[str, Any]], s4s: list[dict[str
         m = _metros(r)
         util = cls in CLASSES_UTEIS
         waste = cls in CLASSES_WASTE
-        no = cls in CLASSES_NO
+        no = cls == "NO PAINEL"
         t = str(r.get("turno") or "")
         o = str(r.get("otimizadora") or "")
         d = str(r.get("data") or "")
@@ -736,10 +743,15 @@ def _calcular_metricas_cloud(registros: list[dict[str, Any]], s4s: list[dict[str
     return {
         "total_registros": len(regs), "volume_total": round(vol_total, 2), "volume_util": round(vol_util, 2),
         "volume_waste": round(vol_waste, 2), "volume_no": round(vol_no, 2), "pecas_total": int(pec_total),
+        "volume_no_painel": round(vol_no_painel, 2), "perc_no_painel": pct(vol_no_painel, vol_total),
+        "volume_no_total": round(vol_no_total, 2), "perc_no_total": pct(vol_no_total, vol_total),
         "pecas_util": int(pec_util), "pecas_no": int(pec_no),
+        "pecas_no_painel": int(pec_no_painel), "pecas_no_total": int(pec_no_total),
         "pecas_blocks": int(blocks_pecas), "metros_blocks": round(blocks_metros, 2),
         "boards_s4s_entrada": int(s4s_kpi["boards"]), "aproveitamento": pct(vol_util, vol_total),
         "aprov_com_no": pct(vol_util + vol_no, vol_total), "perc_waste": pct(vol_waste, vol_total),
+        "aprov_com_no_painel": pct(vol_util + vol_no_painel, vol_total),
+        "aprov_com_no_total": pct(vol_util + vol_no_total, vol_total),
         "perc_no": pct(vol_no, vol_total),
         "comprimento_medio_blocks_mm": round(blocks_metros / blocks_pecas * 1000, 2) if blocks_pecas else 0,
         "comprimento_medio_blocks_escopo": "cloud_detalhado_util_sem_waste_no_sem_fora_padrao",
