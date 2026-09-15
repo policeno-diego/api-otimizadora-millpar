@@ -19,6 +19,9 @@ from cryptography.fernet import Fernet, InvalidToken
 
 
 APP_VERSION = "render-free-auth-db-0.7-historico-v2"
+DATA_BACKEND = os.getenv("DATA_BACKEND", "firebase").strip().lower()
+TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "").strip()
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
 FIREBASE_BASE_URL = os.getenv(
     "FIREBASE_BASE_URL",
     "https://base-otimizadora-default-rtdb.firebaseio.com",
@@ -210,6 +213,67 @@ def _firebase_set(path: str, body: Any) -> Any:
     return _firebase_request("PUT", path, body)
 
 
+def _storage_path_key(path: str) -> str:
+    return "/".join(p for p in str(path or "").strip("/").split("/") if p)
+
+
+def _turso_conn():
+    if not TURSO_DATABASE_URL:
+        raise HTTPException(status_code=500, detail="TURSO_DATABASE_URL nao configurado")
+    if not TURSO_AUTH_TOKEN:
+        raise HTTPException(status_code=500, detail="TURSO_AUTH_TOKEN nao configurado")
+    try:
+        import libsql  # type: ignore
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail="Dependencia libsql nao instalada") from exc
+    return libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+
+
+def _turso_get(path: str) -> Any:
+    key = _storage_path_key(path)
+    conn = _turso_conn()
+    try:
+        row = conn.execute("SELECT payload FROM app_json_store WHERE chave = ?", (key,)).fetchone()
+    finally:
+        conn.close()
+    if not row or row[0] in (None, "", "null"):
+        return None
+    return json.loads(row[0])
+
+
+def _turso_set(path: str, body: Any) -> Any:
+    key = _storage_path_key(path)
+    payload = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    conn = _turso_conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO app_json_store (chave, payload, updated_at)
+            VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            ON CONFLICT(chave) DO UPDATE SET
+                payload = excluded.payload,
+                updated_at = excluded.updated_at
+            """,
+            (key, payload),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True}
+
+
+def _storage_get(path: str) -> Any:
+    if DATA_BACKEND == "turso":
+        return _turso_get(path)
+    return _firebase_get(path)
+
+
+def _storage_set(path: str, body: Any) -> Any:
+    if DATA_BACKEND == "turso":
+        return _turso_set(path, body)
+    return _firebase_set(path, body)
+
+
 def _user_db_secret() -> str:
     secret = AUTH_USER_DB_SECRET or AUTH_TOKEN_SECRET or API_TOKEN
     if not secret:
@@ -223,7 +287,7 @@ def _fernet() -> Fernet:
 
 
 def _auth_users_db_read() -> dict[str, Any]:
-    db = _firebase_get(AUTH_USER_DB_PATH) or {}
+    db = _storage_get(AUTH_USER_DB_PATH) or {}
     if not isinstance(db, dict) or not db.get("ciphertext"):
         return {}
     try:
@@ -237,7 +301,7 @@ def _auth_users_db_read() -> dict[str, Any]:
 def _auth_users_db_write(users: dict[str, Any]) -> None:
     raw = json.dumps(users, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     token = _fernet().encrypt(raw).decode("utf-8")
-    _firebase_set(
+    _storage_set(
         AUTH_USER_DB_PATH,
         {
             "version": 1,
@@ -408,7 +472,7 @@ def _carregar_dados_detalhados(data_inicio: str, data_fim: str) -> tuple[list[di
     registros: list[dict[str, Any]] = []
     s4s: list[dict[str, Any]] = []
     for dia in _datas_periodo(data_inicio, data_fim):
-        dados_dia = _firebase_get(f"dados_detalhados/{dia}") or {}
+        dados_dia = _storage_get(f"dados_detalhados/{dia}") or {}
         if isinstance(dados_dia, dict):
             compacto = dados_dia.get("registros_compactos") or {}
             registros_diretos = dados_dia.get("registros") or []
@@ -781,7 +845,7 @@ def _calcular_metricas_cloud(registros: list[dict[str, Any]], s4s: list[dict[str
         "top_produtos": top_produtos, "historico_diario": historico_diario,
         "analise_turno_otim": turno_otim_fmt, "comparativo_diario": comparativo_diario, "analise_bitolas": analise_bitolas,
         "mapa_calor": {"datas": sorted(diario_map), "turnos": ["A", "B", "C"], "celulas": mapa_celulas, "meta": 78.2},
-        "fontes_dados": {"origem": "Firebase dados_detalhados", "modo": "calculo_na_api_render"},
+        "fontes_dados": {"origem": f"{DATA_BACKEND} dados_detalhados", "modo": "calculo_na_api_render"},
     }
 
 
@@ -794,9 +858,9 @@ def _snapshot(force: bool = False) -> dict[str, Any]:
     ):
         return _cache["snapshot"]
 
-    data = _firebase_get(SNAPSHOT_PATH)
+    data = _storage_get(SNAPSHOT_PATH)
     if not isinstance(data, dict):
-        raise HTTPException(status_code=503, detail="Snapshot Firebase vazio ou invalido")
+        raise HTTPException(status_code=503, detail=f"Snapshot {DATA_BACKEND} vazio ou invalido")
 
     _cache["snapshot"] = data
     _cache["ts"] = now
@@ -881,7 +945,8 @@ def api_status(
         "gerado_em": snap.get("gerado_em"),
         "periodo": snap.get("periodo", {}),
         "rede": snap.get("rede", {}),
-        "firebase_path": SNAPSHOT_PATH,
+        "data_backend": DATA_BACKEND,
+        "snapshot_path": SNAPSHOT_PATH,
     }
 
 
@@ -948,7 +1013,7 @@ def api_dados(
             registros, s4s, data_inicio_calc, data_fim_calc, turno, otimizadora, bitola, produto
         )
         res = _with_runtime_fields(res, snap)
-        res["_origem_dados"] = "firebase_dados_detalhados"
+        res["_origem_dados"] = f"{DATA_BACKEND}_dados_detalhados"
         return res
 
     key = _firebase_view_key(data_inicio, data_fim, turno, otimizadora, bitola, produto, snap)
@@ -973,7 +1038,7 @@ def api_historico_minuto(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     _check_token(x_api_token, authorization)
-    historico = _firebase_get(f"historico_minuto/{data}") or {}
+    historico = _storage_get(f"historico_minuto/{data}") or {}
     return {"data": data, "historico": historico}
 
 
@@ -1231,6 +1296,7 @@ def debug_snapshot_path(
     token_configurado = bool(API_TOKEN)
     return {
         "firebase_base_url": FIREBASE_BASE_URL,
+        "data_backend": DATA_BACKEND,
         "snapshot_path": SNAPSHOT_PATH,
         "cache_seconds": CACHE_SECONDS,
         "token_configurado": token_configurado,
@@ -1238,6 +1304,7 @@ def debug_snapshot_path(
         "auth_users_configurados": bool(_auth_users()),
         "firebase_verify_ssl": FIREBASE_VERIFY_SSL,
         "firebase_auth_configurado": bool(FIREBASE_AUTH_TOKEN),
+        "turso_configurado": bool(TURSO_DATABASE_URL and TURSO_AUTH_TOKEN),
         "url_teste_dados": str(request.url_for("api_dados"))
         + "?"
         + urlencode({"data_inicio": "", "data_fim": ""}),

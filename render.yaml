@@ -6,6 +6,12 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
+      - key: DATA_BACKEND
+        value: firebase
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
       - key: FIREBASE_BASE_URL
         value: https://base-otimizadora-default-rtdb.firebaseio.com
       - key: FIREBASE_AUTH_TOKEN
