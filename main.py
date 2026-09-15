@@ -23,6 +23,8 @@ FIREBASE_BASE_URL = os.getenv(
     "FIREBASE_BASE_URL",
     "https://base-otimizadora-default-rtdb.firebaseio.com",
 ).rstrip("/")
+FIREBASE_AUTH_TOKEN = os.getenv("FIREBASE_AUTH_TOKEN", "").strip()
+FIREBASE_AUTH_PARAM = os.getenv("FIREBASE_AUTH_PARAM", "auth").strip() or "auth"
 SNAPSHOT_PATH = os.getenv("SNAPSHOT_PATH", "snapshot").strip("/")
 API_TOKEN = os.getenv("API_TOKEN", "").strip()
 AUTH_TOKEN_SECRET = os.getenv("AUTH_TOKEN_SECRET", API_TOKEN).strip()
@@ -30,12 +32,20 @@ AUTH_USERS_JSON = os.getenv("AUTH_USERS_JSON", "").strip()
 AUTH_TOKEN_TTL_HOURS = int(os.getenv("AUTH_TOKEN_TTL_HOURS", "12"))
 AUTH_USER_DB_PATH = os.getenv("AUTH_USER_DB_PATH", "auth/usuarios_app").strip("/")
 AUTH_USER_DB_SECRET = os.getenv("AUTH_USER_DB_SECRET", AUTH_TOKEN_SECRET).strip()
-ALLOW_PUBLIC_READ = os.getenv("ALLOW_PUBLIC_READ", "true").strip().lower() in {
+ALLOW_PUBLIC_READ = os.getenv("ALLOW_PUBLIC_READ", "false").strip().lower() in {
     "1",
     "true",
     "sim",
     "yes",
 }
+DEBUG_ENDPOINTS_ENABLED = os.getenv("DEBUG_ENDPOINTS_ENABLED", "false").strip().lower() in {
+    "1",
+    "true",
+    "sim",
+    "yes",
+}
+_cors_origins_raw = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
+CORS_ALLOW_ORIGINS = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()] or ["*"]
 CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "10"))
 FIREBASE_VERIFY_SSL = os.getenv("FIREBASE_VERIFY_SSL", "true").strip().lower() not in {
     "0",
@@ -48,7 +58,7 @@ FIREBASE_VERIFY_SSL = os.getenv("FIREBASE_VERIFY_SSL", "true").strip().lower() n
 app = FastAPI(title="API Otimizadora Millpar", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -175,7 +185,10 @@ def _validar_role(role: str) -> str:
 
 def _firebase_url(path: str) -> str:
     safe_path = "/".join(quote(p, safe="") for p in path.strip("/").split("/") if p)
-    return f"{FIREBASE_BASE_URL}/{safe_path}.json"
+    url = f"{FIREBASE_BASE_URL}/{safe_path}.json"
+    if FIREBASE_AUTH_TOKEN:
+        url += "?" + urlencode({FIREBASE_AUTH_PARAM: FIREBASE_AUTH_TOKEN})
+    return url
 
 
 def _firebase_request(method: str, path: str, body: Any | None = None) -> Any:
@@ -318,7 +331,12 @@ def _validar_token_sessao(token: str) -> dict[str, Any] | None:
         return None
     if int(payload.get("exp") or 0) < int(time.time()):
         return None
-    if str(payload.get("sub") or "") not in _auth_users():
+    usuario = str(payload.get("sub") or "")
+    users = _auth_users()
+    if usuario not in users:
+        return None
+    info = users.get(usuario)
+    if isinstance(info, dict) and not bool(info.get("ativo", True)):
         return None
     return payload
 
@@ -1201,7 +1219,15 @@ def api_admin_excluir_usuario(
 
 
 @app.get("/debug/snapshot-path")
-def debug_snapshot_path(request: FastApiRequest) -> dict[str, Any]:
+def debug_snapshot_path(
+    request: FastApiRequest,
+    x_api_token: str | None = Header(default=None),
+    x_auth_token: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    if not DEBUG_ENDPOINTS_ENABLED:
+        raise HTTPException(status_code=404, detail="Endpoint indisponivel")
+    _require_admin(x_api_token, authorization, x_auth_token)
     token_configurado = bool(API_TOKEN)
     return {
         "firebase_base_url": FIREBASE_BASE_URL,
@@ -1211,6 +1237,7 @@ def debug_snapshot_path(request: FastApiRequest) -> dict[str, Any]:
         "allow_public_read": ALLOW_PUBLIC_READ,
         "auth_users_configurados": bool(_auth_users()),
         "firebase_verify_ssl": FIREBASE_VERIFY_SSL,
+        "firebase_auth_configurado": bool(FIREBASE_AUTH_TOKEN),
         "url_teste_dados": str(request.url_for("api_dados"))
         + "?"
         + urlencode({"data_inicio": "", "data_fim": ""}),

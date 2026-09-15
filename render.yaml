@@ -8,6 +8,10 @@ services:
     envVars:
       - key: FIREBASE_BASE_URL
         value: https://base-otimizadora-default-rtdb.firebaseio.com
+      - key: FIREBASE_AUTH_TOKEN
+        sync: false
+      - key: FIREBASE_AUTH_PARAM
+        value: auth
       - key: SNAPSHOT_PATH
         value: snapshot
       - key: CACHE_SECONDS
@@ -16,6 +20,10 @@ services:
         value: "true"
       - key: ALLOW_PUBLIC_READ
         value: "false"
+      - key: DEBUG_ENDPOINTS_ENABLED
+        value: "false"
+      - key: CORS_ALLOW_ORIGINS
+        value: "*"
       - key: API_TOKEN
         sync: false
       - key: AUTH_TOKEN_SECRET
