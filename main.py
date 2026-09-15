@@ -129,6 +129,10 @@ class AtualizarUsuarioPayload(BaseModel):
     trocar_senha: bool | None = None
 
 
+class PublicadorPayload(BaseModel):
+    payload: Any
+
+
 def _json_b64(payload: dict[str, Any]) -> str:
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
@@ -272,6 +276,44 @@ def _storage_set(path: str, body: Any) -> Any:
     if DATA_BACKEND == "turso":
         return _turso_set(path, body)
     return _firebase_set(path, body)
+
+
+def _registrar_status_publicador(caminho: str, origem: str = "api_publicador") -> None:
+    agora = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    status = _storage_get("publicador/status") or {}
+    if not isinstance(status, dict):
+        status = {}
+    status.update(
+        {
+            "online": True,
+            "backend": DATA_BACKEND,
+            "origem": origem,
+            "ultimo_caminho": caminho,
+            "ultimo_recebimento": agora,
+        }
+    )
+    if caminho == SNAPSHOT_PATH:
+        status["ultimo_snapshot"] = agora
+    elif caminho.startswith("dados_detalhados/"):
+        status["ultimo_dados_detalhados"] = agora
+    elif caminho.startswith("historico_minuto/"):
+        status["ultimo_historico_minuto"] = agora
+    _storage_set("publicador/status", status)
+
+
+def _validar_caminho_publicador(caminho: str) -> str:
+    caminho = _storage_path_key(caminho)
+    permitidos = (
+        SNAPSHOT_PATH,
+        "dados_detalhados/",
+        "historico_minuto/",
+        "publicador/status",
+    )
+    if caminho == SNAPSHOT_PATH or caminho == "publicador/status":
+        return caminho
+    if caminho.startswith("dados_detalhados/") or caminho.startswith("historico_minuto/"):
+        return caminho
+    raise HTTPException(status_code=400, detail="Caminho de publicacao nao permitido")
 
 
 def _user_db_secret() -> str:
@@ -1050,6 +1092,40 @@ def api_reprocessar(
     _check_token(x_api_token, authorization)
     _snapshot(force=True)
     return {"sucesso": True, "origem": "render", "acao": "snapshot_recarregado"}
+
+
+@app.get("/api/publicador/status")
+def api_publicador_status(
+    x_api_token: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _check_token(x_api_token, authorization)
+    status = _storage_get("publicador/status") or {}
+    return {"ok": True, "status": status, "backend": DATA_BACKEND}
+
+
+@app.post("/api/publicador/{caminho:path}")
+def api_publicador_set(
+    caminho: str,
+    payload: PublicadorPayload,
+    x_api_token: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_admin(x_api_token, authorization)
+    caminho_validado = _validar_caminho_publicador(caminho)
+    _storage_set(caminho_validado, payload.payload)
+    if caminho_validado == SNAPSHOT_PATH:
+        _cache.update({"ts": 0.0, "snapshot": None})
+    if caminho_validado.startswith("dados_detalhados/"):
+        _dados_cache.update({"ts": 0.0, "chave": "", "registros": [], "s4s": []})
+    if caminho_validado != "publicador/status":
+        _registrar_status_publicador(caminho_validado)
+    return {
+        "ok": True,
+        "backend": DATA_BACKEND,
+        "caminho": caminho_validado,
+        "recebido_em": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
 
 
 @app.get("/api/auth/ping")
