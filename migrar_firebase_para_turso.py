@@ -1,6 +1,7 @@
 import json
 import os
 import ssl
+import time
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
@@ -23,6 +24,7 @@ SNAPSHOT_PATH = os.getenv("SNAPSHOT_PATH", "snapshot").strip("/")
 AUTH_USER_DB_PATH = os.getenv("AUTH_USER_DB_PATH", "auth/usuarios_app").strip("/")
 TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "").strip()
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+RETRY_TOTAL = int(os.getenv("TURSO_MIGRATION_RETRY_TOTAL", "4"))
 
 
 def firebase_url(path: str) -> str:
@@ -43,17 +45,36 @@ def firebase_get(path: str):
     return json.loads(raw)
 
 
-def salvar_json(conn, chave: str, payload) -> None:
-    conn.execute(
-        """
-        INSERT INTO app_json_store (chave, payload, updated_at)
-        VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-        ON CONFLICT(chave) DO UPDATE SET
-            payload = excluded.payload,
-            updated_at = excluded.updated_at
-        """,
-        (chave, json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),
-    )
+def conectar_turso():
+    return libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+
+
+def salvar_json(chave: str, payload) -> None:
+    payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    ultimo_erro: Exception | None = None
+    for tentativa in range(1, RETRY_TOTAL + 1):
+        conn = conectar_turso()
+        try:
+            conn.execute(
+                """
+                INSERT INTO app_json_store (chave, payload, updated_at)
+                VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                ON CONFLICT(chave) DO UPDATE SET
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (chave, payload_json),
+            )
+            conn.commit()
+            return
+        except Exception as exc:
+            ultimo_erro = exc
+            espera = min(2 * tentativa, 8)
+            print(f"  retry {tentativa}/{RETRY_TOTAL}: {chave} ({exc})")
+            time.sleep(espera)
+        finally:
+            conn.close()
+    raise RuntimeError(f"Falha ao gravar {chave}") from ultimo_erro
 
 
 def criar_schema(conn) -> None:
@@ -86,9 +107,13 @@ def main() -> None:
         "historico_minuto",
     ]
 
-    conn = libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+    conn = conectar_turso()
     try:
         criar_schema(conn)
+    finally:
+        conn.close()
+
+    try:
         for path in itens:
             print(f"Lendo Firebase: {path}")
             payload = firebase_get(path)
@@ -99,19 +124,16 @@ def main() -> None:
             if path in {"dados_detalhados", "historico_minuto"} and isinstance(payload, dict):
                 for subchave, valor in sorted(payload.items()):
                     chave = f"{path}/{subchave}"
-                    salvar_json(conn, chave, valor)
+                    salvar_json(chave, valor)
                     print(f"  gravado: {chave}")
             else:
-                salvar_json(conn, path, payload)
+                salvar_json(path, payload)
                 print(f"  gravado: {path}")
-
-        conn.commit()
-    finally:
-        conn.close()
+    except KeyboardInterrupt:
+        raise SystemExit("Migracao interrompida pelo usuario.")
 
     print("Migracao para Turso concluida.")
 
 
 if __name__ == "__main__":
     main()
-
